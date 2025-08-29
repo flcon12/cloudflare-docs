@@ -1,28 +1,355 @@
----
-pcx_content_type: concept
-title: Keyless SSL
-sidebar:
-  order: 8
----
+# FIGHTZONE017 — DNS + Deploy Pack Elite (Atlas)
 
-import { FeatureTable, Render } from "~/components";
+Abaixo está **o pacote completo** para: (1) apontar `fightzone017.com.br` e `www` **direto** para a sua página e (2) entregar **HTML + CSS + JSON‑LD (schema) + SEO + PWA + headers de segurança** em nível de elite.
 
-<Render file="keyless-ssl-definition" product="ssl" /> <br />
-
-Before configuring Keyless SSL, you should read our [technical background](https://blog.cloudflare.com/keyless-ssl-the-nitty-gritty-technical-details/) on how the technology works and where your infrastructure sits within the scope of the TLS handshake.
-
-The source code for our key server (what you will run) and keyless client (what our servers will contact your key server with) can be [found on GitHub](https://github.com/cloudflare/gokeyless).
+> **Decisão de rota:** vamos servir o site no \`\` e usar **CNAME Flattening** no root (`fightzone017.com.br`) para espelhar o mesmo conteúdo. Assim, `www` e root abrem a **mesma página**.
 
 ---
 
-## Availability
+## 1) DNS (Cloudflare) — zona BIND pronta pra colar
 
-<FeatureTable id="ssl.keyless_ssl" />
+> **O que corrige:** remove o apontamento errado para `www.fightzone.com.br` e acerta o `www` + root no seu host real.
 
-Keyless SSL is only available to Enterprise customers that maintain their own SSL certificate purchased from a valid Certificate Authority. Cloudflare does not supply any certificates for use with Keyless SSL.
+```bind
+;; Domain:     fightzone017.com.br.
+;; Purpose:    Root e WWW entregando a MESMA página oficial.
+;; Provider:   Cloudflare (com CNAME flattening no root)
+
+$ORIGIN fightzone017.com.br.
+$TTL 3600
+
+@       IN  SOA lee.ns.cloudflare.com. dns.cloudflare.com. 2050806579 10000 2400 604800 3600
+        IN  NS  lee.ns.cloudflare.com.
+        IN  NS  perla.ns.cloudflare.com.
+
+; --- WWW é o host oficial do site (origem hospedada) ---
+; SUBSTITUA abaixo pelo SEU host de origem real (ex.: *.pages.dev, *.vercel.app, *.manus.space)
+www     300 IN  CNAME  nghki1cz7nwl.manus.space.  ; cf_tags=cf-proxied:true
+
+; --- Root usa CNAME flattening para entregar o MESMO conteúdo do WWW ---
+@       300 IN  CNAME  www.fightzone017.com.br.    ; cf_tags=cf-proxied:true
+
+; (Opcional) CAA — só emitir TLS por Let’s Encrypt
+@       3600 IN  CAA 0 issue "letsencrypt.org"
+@       3600 IN  CAA 0 issuewild "letsencrypt.org"
+@       3600 IN  CAA 0 iodef "mailto:security@fightzone017.com.br"
+```
+
+**Notas rápidas:**
+
+- Mantenha **DNSSEC** como já estava (DS na registradora). Se já tem DS publicado, **não mexa**.
+- Em **Cloudflare → DNS**, deixe as nuvens **laranja (proxied)** no `@` e no `www`.
+- Se seu host de origem **não** for `nghki1cz7nwl.manus.space.`, troque **somente** essa linha do `www`.
 
 ---
 
-## Limitations
+## 2) Regras de Redirect / Segurança (Cloudflare Rules)
 
-TLS 1.3 is not supported for Keyless SSL.
+### 2.1 Redirects (sempre HTTPS, sem duplicidade de barras)
+
+```json
+{
+  "rules": [
+    {
+      "description": "Forçar HTTPS",
+      "action": "redirect",
+      "expression": "not ssl",
+      "action_parameters": { "from_value": { "status_code": 301, "preserve_query_string": true } }
+    },
+    {
+      "description": "Normalizar barras duplas",
+      "action": "redirect",
+      "expression": "http.request.uri.path contains \"//\"",
+      "action_parameters": { "from_value": { "status_code": 301, "target_url": "https://{http.host}{regex_replace(http.request.uri.path, '(//+)', '/')}" } }
+    }
+  ]
+}
+```
+
+### 2.2 Worker de headers (HSTS, CSP, XSS, cache)
+
+\`\` (Cloudflare Worker)
+
+```js
+export default {
+  async fetch(request, env, ctx) {
+    const resp = await fetch(request);
+    // Clone headers
+    const newHeaders = new Headers(resp.headers);
+
+    // Segurança
+    newHeaders.set('Strict-Transport-Security', 'max-age=31536000; includeSubDomains; preload');
+    newHeaders.set('X-Content-Type-Options', 'nosniff');
+    newHeaders.set('X-Frame-Options', 'SAMEORIGIN');
+    newHeaders.set('Referrer-Policy', 'strict-origin-when-cross-origin');
+    newHeaders.set('Permissions-Policy', 'geolocation=(), microphone=(), camera=()');
+
+    // CSP enxuta (ajuste domínios se usar externos)
+    newHeaders.set('Content-Security-Policy', [
+      "default-src 'self'",
+      "style-src 'self' 'unsafe-inline'",
+      "script-src 'self' 'unsafe-inline'",
+      "img-src 'self' data:",
+      "font-src 'self' data:",
+      "connect-src 'self'",
+      "frame-ancestors 'self'"
+    ].join('; '));
+
+    // Cache estático básico
+    if (request.method === 'GET' && new URL(request.url).pathname.match(/\.(css|js|png|svg|ico|webmanifest)$/)) {
+      newHeaders.set('Cache-Control', 'public, max-age=31536000, immutable');
+    }
+
+    return new Response(resp.body, { status: resp.status, statusText: resp.statusText, headers: newHeaders });
+  }
+};
+```
+
+\`\` (rota do Worker)
+
+```toml
+name = "edge-headers-fz017"
+main = "edge-headers.js"
+compatibility_date = "2024-12-01"
+
+[routes]
+include = ["fightzone017.com.br/*", "www.fightzone017.com.br/*"]
+```
+
+> Publique com `wrangler deploy` e associe às rotas. Esse Worker **não** altera HTML, só **anexa headers** de segurança e cache.
+
+---
+
+## 3) Site — HTML + CSS + SEO + Schema + PWA
+
+> Estrutura mínima profissional. Cores **preto/branco/vermelho**, identidade **FIGHT ZONE 017** e microdados completos.
+
+### 3.1 `/index.html`
+
+```html
+<!doctype html>
+<html lang="pt-br">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>FIGHT ZONE 017 — Treino monitorado, intensidade elevada</title>
+  <meta name="description" content="No FIGHT ZONE017, você não treina no escuro. Funcional encontra luta. Força encontra estratégia. Cada movimento te aproxima da sua melhor versão." />
+  <meta name="theme-color" content="#000000" />
+
+  <!-- Open Graph -->
+  <meta property="og:type" content="website" />
+  <meta property="og:site_name" content="FIGHT ZONE 017" />
+  <meta property="og:title" content="FIGHT ZONE 017 — Onde sua dedicação encontra resultado" />
+  <meta property="og:description" content="Treino monitorado, intensidade elevada, resultado implacável." />
+  <meta property="og:url" content="https://www.fightzone017.com.br/" />
+  <meta property="og:image" content="/assets/og-fightzone017.jpg" />
+
+  <!-- Twitter -->
+  <meta name="twitter:card" content="summary_large_image" />
+  <meta name="twitter:title" content="FIGHT ZONE 017" />
+  <meta name="twitter:description" content="Treino monitorado, intensidade elevada, resultado implacável." />
+  <meta name="twitter:image" content="/assets/og-fightzone017.jpg" />
+
+  <!-- Canonical -->
+  <link rel="canonical" href="https://www.fightzone017.com.br/" />
+
+  <!-- Icons / Manifest -->
+  <link rel="icon" href="/icons/favicon.ico" />
+  <link rel="apple-touch-icon" href="/icons/apple-touch-icon.png" />
+  <link rel="manifest" href="/manifest.webmanifest" />
+
+  <link rel="preload" href="/styles.css" as="style" />
+  <link rel="stylesheet" href="/styles.css" />
+
+  <!-- JSON-LD: Organização + LocalBusiness + WebSite -->
+  <script type="application/ld+json">
+  {
+    "@context": "https://schema.org",
+    "@graph": [
+      {
+        "@type": "Organization",
+        "@id": "https://www.fightzone017.com.br/#org",
+        "name": "FIGHT ZONE 017",
+        "url": "https://www.fightzone017.com.br/",
+        "logo": "https://www.fightzone017.com.br/assets/logo-fightzone017.png",
+        "sameAs": [
+          "https://www.instagram.com/zero17studio"
+        ]
+      },
+      {
+        "@type": "SportsActivityLocation",
+        "@id": "https://www.fightzone017.com.br/#local",
+        "name": "ZERO17 — FIGHT ZONE 017",
+        "url": "https://www.fightzone017.com.br/",
+        "address": {
+          "@type": "PostalAddress",
+          "addressLocality": "Olímpia",
+          "addressRegion": "SP",
+          "addressCountry": "BR"
+        },
+        "geo": {"@type": "GeoCoordinates", "latitude": -20.737, "longitude": -48.914},
+        "image": "https://www.fightzone017.com.br/assets/og-fightzone017.jpg",
+        "telephone": "+55-17-0000-0000"
+      },
+      {
+        "@type": "WebSite",
+        "@id": "https://www.fightzone017.com.br/#website",
+        "url": "https://www.fightzone017.com.br/",
+        "name": "FIGHT ZONE 017",
+        "potentialAction": {
+          "@type": "SearchAction",
+          "target": {
+            "@type": "EntryPoint",
+            "urlTemplate": "https://www.fightzone017.com.br/?q={search_term_string}"
+          },
+          "query-input": "required name=search_term_string"
+        }
+      }
+    ]
+  }
+  </script>
+</head>
+<body>
+  <header class="hero">
+    <img class="logo" src="/assets/logo-fightzone017.svg" alt="FIGHT ZONE 017" />
+    <h1>Onde sua dedicação encontra resultado</h1>
+    <p class="subtitle">Treino monitorado • Intensidade elevada • Resultado implacável</p>
+    <a class="cta" href="#agenda">VEM PRA ZERO17</a>
+  </header>
+
+  <main class="container">
+    <section class="grid">
+      <article class="card">
+        <h2>FIGTH ZONE TIME</h2>
+        <p>8 rounds, 1 min por estação. Pad livre com coach + exercício alvo. Fluidez, pressão e método.</p>
+      </article>
+      <article class="card">
+        <h2>Metodologia baseada em ciência</h2>
+        <p>Volume, RPE, pico de contração e progressão. Sem achismo.</p>
+      </article>
+      <article class="card">
+        <h2>Ambiente brutalista</h2>
+        <p>Preto, branco e vermelho. Luz certa. Foco total. Sem distração.</p>
+      </article>
+    </section>
+
+    <section id="agenda" class="agenda">
+      <h2>Agenda</h2>
+      <ul>
+        <li><strong>Sábado</strong> — Aulão FIGTH ZONE 017 — 08:00</li>
+        <li><strong>Seg/Qua</strong> — Turma Performance — 19:00</li>
+      </ul>
+    </section>
+  </main>
+
+  <footer class="footer">
+    <small>© <span id="y"></span> FIGHT ZONE 017 — ZERO17 Studio</small>
+  </footer>
+
+  <script>
+    document.getElementById('y').textContent = new Date().getFullYear();
+    if ('serviceWorker' in navigator) { navigator.serviceWorker.register('/service-worker.js'); }
+  </script>
+</body>
+</html>
+```
+
+### 3.2 `/styles.css`
+
+```css
+:root {
+  --black:#000; --white:#fff; --red:#E10600; --gray:#111; --card:#0A0A0A;
+}
+* {box-sizing:border-box}
+html,body {margin:0; padding:0; background:var(--black); color:var(--white); font:16px/1.5 system-ui, -apple-system, Segoe UI, Roboto, Ubuntu, Cantarell, Noto Sans, Arial, "Helvetica Neue", sans-serif}
+
+.hero {min-height:72vh; display:grid; place-content:center; text-align:center; padding:64px 20px; background:linear-gradient(180deg, #000 0%, #0A0A0A 100%)}
+.logo {width:160px; height:auto; margin:0 auto 16px; filter:drop-shadow(0 0 12px rgba(225,6,0,.25))}
+h1 {font-size:clamp(28px, 4vw, 48px); letter-spacing:.5px; margin:8px 0}
+.subtitle {opacity:.8; margin:.25rem 0 1.5rem}
+.cta {display:inline-block; padding:14px 22px; background:var(--red); color:var(--white); border-radius:14px; font-weight:700; text-decoration:none}
+.cta:hover {transform:translateY(-1px)}
+
+.container {max-width:1100px; margin:0 auto; padding:40px 20px}
+.grid {display:grid; gap:18px; grid-template-columns:repeat(auto-fit, minmax(260px, 1fr))}
+.card {background:var(--card); border:1px solid #1a1a1a; border-radius:18px; padding:20px}
+.card h2 {color:var(--red); margin-top:0}
+
+.agenda h2 {color:var(--red)}
+.footer {border-top:1px solid #1a1a1a; margin-top:60px; padding:24px 20px; text-align:center; opacity:.7}
+```
+
+### 3.3 `/manifest.webmanifest`
+
+```json
+{
+  "name": "FIGHT ZONE 017",
+  "short_name": "FZ017",
+  "start_url": "/",
+  "display": "standalone",
+  "background_color": "#000000",
+  "theme_color": "#000000",
+  "icons": [
+    {"src": "/icons/icon-192.png", "sizes": "192x192", "type": "image/png"},
+    {"src": "/icons/icon-512.png", "sizes": "512x512", "type": "image/png"}
+  ]
+}
+```
+
+### 3.4 `/robots.txt`
+
+```txt
+User-agent: *
+Allow: /
+Sitemap: https://www.fightzone017.com.br/sitemap.xml
+```
+
+### 3.5 `/sitemap.xml`
+
+```xml
+<?xml version="1.0" encoding="UTF-8"?>
+<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">
+  <url>
+    <loc>https://www.fightzone017.com.br/</loc>
+    <changefreq>weekly</changefreq>
+    <priority>1.0</priority>
+  </url>
+</urlset>
+```
+
+### 3.6 `/service-worker.js`
+
+```js
+self.addEventListener('install', (e) => { self.skipWaiting(); });
+self.addEventListener('activate', (e) => { self.clients.claim(); });
+self.addEventListener('fetch', (event) => {
+  event.respondWith((async () => {
+    try { return await fetch(event.request); } catch (e) { return new Response('offline', {status:200}); }
+  })());
+});
+```
+
+---
+
+## 4) Checklist de Deploy (modo turbo)
+
+1. **DNS** → Cloudflare → cole a zona acima (**troque o host do ****\`\`**** se necessário**) e deixe proxied.
+2. **HTTPS** → certifique que o modo SSL está em **Full (strict)**.
+3. **Worker** → publique `edge-headers.js` com `wrangler deploy` e associe às rotas do domínio.
+4. **Arquivos** → suba `/index.html`, `/styles.css`, `/manifest.webmanifest`, `/robots.txt`, `/sitemap.xml`, `/service-worker.js`, `/assets/*`, `/icons/*` no seu host de origem.
+5. **Cache** → Cloudflare → Purge Everything.
+6. **Teste** → http/https, root e www, mobile + desktop, Lighthouse (>= 90 desempenho/SEO).
+
+---
+
+## 5) Extras (opcionais — avançado)
+
+- **Preloading crítico**: gere CSS crítico inline e post‑carregue o restante.
+- **Imagem OG**: use 1200×630 com logo central e borda vermelha.
+- **Schema Events**: quando publicar aulas/eventos, adicione JSON‑LD do tipo `Event`.
+- **Analytics**: se for usar, preferir algo leve (Plausible/Umami) e liberar no CSP.
+
+---
+
+### Pronto. `fightzone017.com.br` e `www.fightzone017.com.br` vão abrir a MESMA página, com SEO e segurança nível Atlas.
+
